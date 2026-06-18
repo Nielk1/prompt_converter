@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Prompt Pipeline Converter</title>
+    <style>
+        :root {
+            --bg: #0b0f17; --card: #151d2a; --border: #243247;
+            --text: #f1f5f9; --muted: #94a3b8; --dim: #64748b;
+            --accent: #6366f1; --accent-hover: #4f46e5; --good: #34d399;
+            --warn: #f59e0b; --bad: #f87171;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg); color: var(--text); padding: 2rem; margin: 0;
+            display: flex; justify-content: center;
+        }
+        .app-card {
+            width: 100%; max-width: 1280px; background: var(--card);
+            border: 1px solid var(--border); border-radius: 12px; padding: 2rem;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+        }
+        h1 { margin: 0 0 0.25rem 0; font-size: 1.6rem; }
+        .subtitle { color: var(--dim); font-size: 0.9rem; margin-bottom: 1.25rem; line-height: 1.45; }
+        .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.25rem; }
+        button {
+            background: #0f172a; color: var(--text); border: 1px solid var(--border);
+            padding: 0.55rem 0.75rem; border-radius: 6px; cursor: pointer; font-weight: 600;
+        }
+        button:hover { border-color: var(--accent); }
+        .pipeline { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 1.5rem; }
+        @media (max-width: 980px) { .pipeline { grid-template-columns: 1fr; } body { padding: 1rem; } }
+        .column { display: flex; flex-direction: column; min-width: 0; }
+        label {
+            font-size: 0.75rem; text-transform: uppercase; font-weight: bold;
+            letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.5rem;
+        }
+        select {
+            background: #0f172a; border: 1px solid var(--border); color: #fff;
+            padding: 0.6rem; border-radius: 6px; font-weight: 500; margin-bottom: 0.75rem;
+            cursor: pointer; width: 100%;
+        }
+        textarea {
+            width: 100%; flex-grow: 1; min-height: 320px; background: #090d14;
+            border: 1px solid var(--border); color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            padding: 1rem; border-radius: 8px; font-size: 0.9rem; resize: vertical; line-height: 1.45;
+        }
+        textarea:focus { outline: none; border-color: var(--accent); }
+        .json-box { background: #05070a; color: var(--good); font-size: 0.8rem; }
+        .status-row {
+            min-height: 40px; display: flex; align-items: center; justify-content: space-between;
+            gap: 1rem; color: var(--dim); font-size: 0.8rem; font-weight: 600;
+        }
+        .pill { display: inline-flex; align-items: center; gap: 0.35rem; border: 1px solid var(--border); border-radius: 999px; padding: 0.25rem 0.55rem; }
+        .ok { color: var(--good); } .err { color: var(--bad); } .warn { color: var(--warn); }
+        .hint { color: var(--dim); font-size: 0.75rem; line-height: 1.4; margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+<div class="app-card">
+    <h1>Universal UI Prompt Pipeline</h1>
+    <div class="subtitle">
+        Converts common image-generation prompt syntaxes through a normalized AST. The parser is bracket-aware, so commas inside balanced groups are preserved instead of splitting the tag incorrectly.
+    </div>
+
+    <div class="toolbar">
+        <button id="swapBtn" type="button">Swap Input/Output Formats</button>
+        <button id="copyBtn" type="button">Copy Output</button>
+        <button id="sampleBtn" type="button">Load Sample</button>
+        <button id="clearBtn" type="button">Clear</button>
+    </div>
+
+    <div class="pipeline">
+        <div class="column">
+            <label for="inputFormat">1. Input Format</label>
+            <select id="inputFormat"></select>
+            <textarea id="inputText" spellcheck="false" placeholder="Type or paste source prompt text here..."></textarea>
+            <div class="hint" id="inputHint"></div>
+        </div>
+
+        <div class="column">
+            <label>2. Intermediate Structure Matrix</label>
+            <div class="status-row">
+                <span>NORMALIZED JSON AST</span>
+                <span class="pill" id="statusPill">Idle</span>
+            </div>
+            <textarea id="jsonOutput" class="json-box" readonly placeholder="Parsed records generate dynamically..."></textarea>
+        </div>
+
+        <div class="column">
+            <label for="outputFormat">3. Output Target</label>
+            <select id="outputFormat"></select>
+            <textarea id="outputText" readonly spellcheck="false" placeholder="Output compiles dynamically..."></textarea>
+            <div class="hint" id="outputHint"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+(() => {
+    "use strict";
+
+    const ROUND_DIGITS = 4;
+    const SD_UP = 1.1;
+    const SD_DOWN = 1 / 1.1;
+    const NAI_UP = 1.05;
+    const NAI_DOWN = 1 / 1.05;
+    const MAX_DECORATOR_REPEAT = 8;
+
+    const FORMAT_DEFS = [
+        {
+            id: "sd_webui",
+            label: "Stable Diffusion WebUI / InvokeAI / A1111",
+            hint: "Comma tags, (tag), ((tag)), [tag], [[tag]], and explicit (tag:1.2). Supports Negative prompt: blocks."
+        },
+        {
+            id: "sd_metadata",
+            label: "Stable Diffusion PNG Info / Civitai metadata",
+            hint: "Like WebUI, but strips common generation parameter lines such as Steps, Sampler, CFG scale, Seed, Size, and Model."
+        },
+        {
+            id: "novelai",
+            label: "NovelAI",
+            hint: "Comma tags, {tag}, {{tag}}, [tag], and nested emphasis. Curly braces are normalized as 1.05x each."
+        },
+        {
+            id: "comfy_compel",
+            label: "ComfyUI / Compel",
+            hint: "Comma tags, (tag)+, (tag)++, (tag)-, (tag)--, and (tag)1.25 explicit weights."
+        },
+        {
+            id: "plain_commas",
+            label: "Plain comma-separated tags",
+            hint: "Every comma-delimited item becomes a normal-weight tag. Balanced brackets and quotes protect internal commas."
+        },
+        {
+            id: "plain_lines",
+            label: "Plain one-tag-per-line",
+            hint: "Each non-empty line becomes a normal-weight tag. Good for spreadsheets and manual editing."
+        },
+        {
+            id: "weighted_commas",
+            label: "Weighted CSV tags: tag:1.2",
+            hint: "Comma-delimited tag:weight pairs. If no numeric suffix is present, weight defaults to 1."
+        },
+        {
+            id: "weighted_lines",
+            label: "Weighted lines: tag | 1.2",
+            hint: "One tag per line. Supports tag | 1.2, tag\t1.2, tag:1.2, or tag=1.2."
+        },
+        {
+            id: "midjourney",
+            label: "Midjourney-style prompt weights",
+            hint: "Supports phrase::weight and --no negatives. Midjourney parameters are preserved only when parsing this format."
+        },
+        {
+            id: "json_ast",
+            label: "JSON AST",
+            hint: "Reads and writes the normalized array directly: [{ text, weight, role }]."
+        },
+        {
+            id: "yaml_list",
+            label: "Simple YAML list",
+            hint: "Reads/writes simple YAML-ish records with text, weight, and role fields; no external YAML library required."
+        }
+    ];
+
+    function roundWeight(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return 1;
+        return Number(n.toFixed(ROUND_DIGITS));
+    }
+
+    function nearly(a, b, epsilon = 0.0005) {
+        return Math.abs(Number(a) - Number(b)) <= epsilon;
+    }
+
+    function normalizeRole(role) {
+        const r = String(role || "positive").trim().toLowerCase();
+        if (r === "negative" || r === "neg") return "negative";
+        if (r === "metadata" || r === "meta" || r === "parameters" || r === "params") return "metadata";
+        return "positive";
+    }
+
+    function makeItem(text, weight = 1, role = "positive", extra = {}) {
+        return {
+            text: String(text || "").trim(),
+            weight: roundWeight(weight),
+            role: normalizeRole(role),
+            ...extra
+        };
+    }
+
+    function cleanItems(items) {
+        return items
+            .map(i => makeItem(i.text, i.weight, i.role, Object.fromEntries(Object.entries(i).filter(([k]) => !["text", "weight", "role"].includes(k)))))
+            .filter(i => i.text.length > 0);
+    }
+
+    function isEscaped(str, index) {
+        let slashCount = 0;
+        for (let i = index - 1; i >= 0 && str[i] === "\\"; i--) slashCount++;
+        return slashCount % 2 === 1;
+    }
+
+    function splitTopLevel(text, delimiter = ",") {
+        const out = [];
+        const stack = [];
+        let quote = null;
+        let start = 0;
+        const openToClose = { "(": ")", "[": "]", "{": "}" };
+        const closeToOpen = { ")": "(", "]": "[", "}": "{" };
+
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+
+            if (quote) {
+                if (ch === quote && !isEscaped(text, i)) quote = null;
+                continue;
+            }
+
+            if ((ch === "\"" || ch === "'") && !isEscaped(text, i)) {
+                quote = ch;
+                continue;
+            }
+
+            if (openToClose[ch] && !isEscaped(text, i)) {
+                stack.push(ch);
+                continue;
+            }
+
+            if (closeToOpen[ch] && !isEscaped(text, i)) {
+                if (stack[stack.length - 1] === closeToOpen[ch]) stack.pop();
+                continue;
+            }
+
+            if (ch === delimiter && stack.length === 0 && !isEscaped(text, i)) {
+                out.push(text.slice(start, i));
+                start = i + 1;
+            }
+        }
+        out.push(text.slice(start));
+        return out.map(s => s.trim()).filter(Boolean);
+    }
+
+    function splitTopLevelLines(text) {
+        const normalized = text.replace(/\r\n?/g, "\n");
+        const out = [];
+        let quote = null;
+        let stack = [];
+        let start = 0;
+        const openToClose = { "(": ")", "[": "]", "{": "}" };
+        const closeToOpen = { ")": "(", "]": "[", "}": "{" };
+
+        for (let i = 0; i < normalized.length; i++) {
+            const ch = normalized[i];
+            if (quote) {
+                if (ch === quote && !isEscaped(normalized, i)) quote = null;
+                continue;
+            }
+            if ((ch === "\"" || ch === "'") && !isEscaped(normalized, i)) { quote = ch; continue; }
+            if (openToClose[ch] && !isEscaped(normalized, i)) { stack.push(ch); continue; }
+            if (closeToOpen[ch] && !isEscaped(normalized, i)) {
+                if (stack[stack.length - 1] === closeToOpen[ch]) stack.pop();
+                continue;
+            }
+            if (ch === "\n" && stack.length === 0) {
+                out.push(normalized.slice(start, i));
+                start = i + 1;
+            }
+        }
+        out.push(normalized.slice(start));
+        return out.map(s => s.trim()).filter(Boolean);
+    }
+
+    function normalizePromptDelimiters(text) {
+        return text.replace(/\r\n?/g, "\n").replace(/\n+/g, ", ");
+    }
+
+    function matchingOuterPair(str, open, close) {
+        const s = str.trim();
+        if (!s.startsWith(open) || !s.endsWith(close)) return false;
+        let depth = 0;
+        let quote = null;
+        for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            if (quote) {
+                if (ch === quote && !isEscaped(s, i)) quote = null;
+                continue;
+            }
+            if ((ch === "\"" || ch === "'") && !isEscaped(s, i)) { quote = ch; continue; }
+            if (ch === open && !isEscaped(s, i)) depth++;
+            else if (ch === close && !isEscaped(s, i)) {
+                depth--;
+                if (depth === 0 && i !== s.length - 1) return false;
+                if (depth < 0) return false;
+            }
+        }
+        return depth === 0;
+    }
+
+    function findTopLevelLast(str, chars) {
+        const wanted = new Set(chars.split(""));
+        const stack = [];
+        let quote = null;
+        const openToClose = { "(": ")", "[": "]", "{": "}" };
+        const closeToOpen = { ")": "(", "]": "[", "}": "{" };
+        for (let i = str.length - 1; i >= 0; i--) {
+            const ch = str[i];
+            if (isEscaped(str, i)) continue;
+            if (quote) {
+                if (ch === quote) quote = null;
+                continue;
+            }
+            if (ch === "\"" || ch === "'") { quote = ch; continue; }
+            if (closeToOpen[ch]) { stack.push(ch); continue; }
+            if (openToClose[ch]) {
+                const expectedClose = openToClose[ch];
+                if (stack[stack.length - 1] === expectedClose) stack.pop();
+                continue;
+            }
+            if (stack.length === 0 && wanted.has(ch)) return i;
+        }
+        return -1;
+    }
+
+    function unescapePromptText(text) {
+        return String(text || "")
+            .replace(/\\([,()\[\]{}:|=+\-\\])/g, "$1")
+            .trim();
+    }
+
+    function escapeForDelimitedText(text) {
+        return String(text || "")
+            .replace(/\\/g, "\\\\")
+            .replace(/,/g, "\\,")
+            .trim();
+    }
+
+    function escapeForWeightedParens(text) {
+        return String(text || "")
+            .replace(/\\/g, "\\\\")
+            .replace(/\(/g, "\\(")
+            .replace(/\)/g, "\\)")
+            .replace(/\[/g, "\\[")
+            .replace(/\]/g, "\\]")
+            .replace(/,/g, "\\,")
+            .replace(/:/g, "\\:")
+            .trim();
+    }
+
+    function parseNumberStrict(value) {
+        const s = String(value || "").trim();
+        if (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(s)) return null;
+        const n = Number(s);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    function parseDecoratedToken(token, options) {
+        let cur = String(token || "").trim();
+        let weight = 1;
+        let changed = true;
+        const upPairs = options.upPairs || [];
+        const downPairs = options.downPairs || [];
+        const explicitParens = options.explicitParens !== false;
+
+        while (changed) {
+            changed = false;
+
+            if (explicitParens && matchingOuterPair(cur, "(", ")")) {
+                const inner = cur.slice(1, -1).trim();
+                const colon = findTopLevelLast(inner, ":");
+                if (colon >= 0) {
+                    const suffix = inner.slice(colon + 1).trim();
+                    const explicit = parseNumberStrict(suffix);
+                    if (explicit !== null) {
+                        weight *= explicit;
+                        cur = inner.slice(0, colon).trim();
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+
+            for (const pair of upPairs) {
+                if (matchingOuterPair(cur, pair.open, pair.close)) {
+                    weight *= pair.factor;
+                    cur = cur.slice(1, -1).trim();
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) continue;
+
+            for (const pair of downPairs) {
+                if (matchingOuterPair(cur, pair.open, pair.close)) {
+                    weight *= pair.factor;
+                    cur = cur.slice(1, -1).trim();
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        return makeItem(unescapePromptText(cur), weight, options.role || "positive");
+    }
+
+    function parsePositiveNegativeBlocks(text, stripMetadata = false) {
+        let source = String(text || "").replace(/\r\n?/g, "\n").trim();
+        let metadata = "";
+        if (stripMetadata) {
+            const parameterMatch = source.match(/(?:^|\n)(Steps|Sampler|CFG scale|Seed|Size|Model hash|Model|Clip skip|Denoising strength|Hires upscale|Hires steps|Version):\s/i);
+            if (parameterMatch && typeof parameterMatch.index === "number") {
+                metadata = source.slice(parameterMatch.index).trim();
+                source = source.slice(0, parameterMatch.index).trim();
+            }
+        }
+
+        const negMatch = source.match(/(?:^|\n)\s*Negative prompt\s*:/i);
+        if (!negMatch || typeof negMatch.index !== "number") {
+            return { positive: source, negative: "", metadata };
+        }
+
+        const before = source.slice(0, negMatch.index).trim();
+        const negStart = negMatch.index + negMatch[0].length;
+        let after = source.slice(negStart).trim();
+        const paramInNeg = after.match(/(?:^|\n)(Steps|Sampler|CFG scale|Seed|Size|Model hash|Model|Clip skip|Denoising strength|Hires upscale|Hires steps|Version):\s/i);
+        if (paramInNeg && typeof paramInNeg.index === "number") {
+            metadata = after.slice(paramInNeg.index).trim();
+            after = after.slice(0, paramInNeg.index).trim();
+        }
+        return { positive: before, negative: after, metadata };
+    }
+
+    function parseCommaPrompt(text, role, tokenParser) {
+        return splitTopLevel(normalizePromptDelimiters(text), ",").map(t => tokenParser(t, role));
+    }
+
+    function parseSD(text, stripMetadata = false) {
+        const blocks = parsePositiveNegativeBlocks(text, stripMetadata);
+        const parser = (token, role) => parseDecoratedToken(token, {
+            role,
+            upPairs: [{ open: "(", close: ")", factor: SD_UP }],
+            downPairs: [{ open: "[", close: "]", factor: SD_DOWN }],
+            explicitParens: true
+        });
+        const items = [
+            ...parseCommaPrompt(blocks.positive, "positive", parser),
+            ...parseCommaPrompt(blocks.negative, "negative", parser)
+        ];
+        if (blocks.metadata) {
+            items.push(makeItem(blocks.metadata, 1, "metadata", { kind: "generation_parameters" }));
+        }
+        return cleanItems(items);
+    }
+
+    function parseNovelAI(text) {
+        const blocks = parsePositiveNegativeBlocks(text, false);
+        const parser = (token, role) => parseDecoratedToken(token, {
+            role,
+            upPairs: [{ open: "{", close: "}", factor: NAI_UP }],
+            downPairs: [{ open: "[", close: "]", factor: NAI_DOWN }],
+            explicitParens: true
+        });
+        return cleanItems([
+            ...parseCommaPrompt(blocks.positive, "positive", parser),
+            ...parseCommaPrompt(blocks.negative, "negative", parser)
+        ]);
+    }
+
+    function parseCompelToken(token, role) {
+        let cur = String(token || "").trim();
+        let weight = 1;
+
+        const suffixMatch = cur.match(/^(.*?)([+\-]+)$/);
+        if (suffixMatch && matchingOuterPair(suffixMatch[1].trim(), "(", ")")) {
+            cur = suffixMatch[1].trim().slice(1, -1).trim();
+            for (const ch of suffixMatch[2]) weight *= ch === "+" ? SD_UP : SD_DOWN;
+            return makeItem(unescapePromptText(cur), weight, role);
+        }
+
+        const explicitMatch = cur.match(/^(.*?)\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))$/);
+        if (explicitMatch && matchingOuterPair(explicitMatch[1].trim(), "(", ")")) {
+            cur = explicitMatch[1].trim().slice(1, -1).trim();
+            weight *= Number(explicitMatch[2]);
+            return makeItem(unescapePromptText(cur), weight, role);
+        }
+
+        return parseDecoratedToken(cur, {
+            role,
+            upPairs: [{ open: "(", close: ")", factor: SD_UP }],
+            downPairs: [{ open: "[", close: "]", factor: SD_DOWN }],
+            explicitParens: true
+        });
+    }
+
+    function parseCompel(text) {
+        const blocks = parsePositiveNegativeBlocks(text, false);
+        return cleanItems([
+            ...parseCommaPrompt(blocks.positive, "positive", parseCompelToken),
+            ...parseCommaPrompt(blocks.negative, "negative", parseCompelToken)
+        ]);
+    }
+
+    function parsePlainCommas(text) {
+        const blocks = parsePositiveNegativeBlocks(text, false);
+        return cleanItems([
+            ...splitTopLevel(normalizePromptDelimiters(blocks.positive), ",").map(t => makeItem(unescapePromptText(t), 1, "positive")),
+            ...splitTopLevel(normalizePromptDelimiters(blocks.negative), ",").map(t => makeItem(unescapePromptText(t), 1, "negative"))
+        ]);
+    }
+
+    function parsePlainLines(text) {
+        return cleanItems(splitTopLevelLines(text).map(line => {
+            const roleMatch = line.match(/^\s*(positive|negative|neg|metadata)\s*:\s*(.+)$/i);
+            if (roleMatch) return makeItem(unescapePromptText(roleMatch[2]), 1, normalizeRole(roleMatch[1]));
+            return makeItem(unescapePromptText(line), 1, "positive");
+        }));
+    }
+
+    function parseWeightedToken(token, role, lineMode = false) {
+        const s = String(token || "").trim();
+        const candidates = lineMode ? ["|", "\t", "=", ":"] : [":", "|", "=", "\t"];
+        for (const delim of candidates) {
+            const idx = delim === "\t" ? s.lastIndexOf("\t") : findTopLevelLast(s, delim);
+            if (idx >= 0) {
+                const left = s.slice(0, idx).trim();
+                const right = s.slice(idx + delim.length).trim();
+                const n = parseNumberStrict(right);
+                if (left && n !== null) return makeItem(unescapePromptText(left), n, role);
+            }
+        }
+        return makeItem(unescapePromptText(s), 1, role);
+    }
+
+    function parseWeightedCommas(text) {
+        const blocks = parsePositiveNegativeBlocks(text, false);
+        return cleanItems([
+            ...splitTopLevel(normalizePromptDelimiters(blocks.positive), ",").map(t => parseWeightedToken(t, "positive", false)),
+            ...splitTopLevel(normalizePromptDelimiters(blocks.negative), ",").map(t => parseWeightedToken(t, "negative", false))
+        ]);
+    }
+
+    function parseWeightedLines(text) {
+        return cleanItems(splitTopLevelLines(text).map(line => {
+            const roleMatch = line.match(/^\s*(positive|negative|neg)\s*:\s*(.+)$/i);
+            if (roleMatch) return parseWeightedToken(roleMatch[2], normalizeRole(roleMatch[1]), true);
+            return parseWeightedToken(line, "positive", true);
+        }));
+    }
+
+    function splitMidjourneyNo(text) {
+        const raw = String(text || "").replace(/\r\n?/g, "\n").trim();
+        const noMatch = raw.match(/(?:^|\s)--no\s+/i);
+        if (!noMatch || typeof noMatch.index !== "number") return { positive: raw, negative: "", params: "" };
+        const before = raw.slice(0, noMatch.index).trim();
+        let after = raw.slice(noMatch.index + noMatch[0].length).trim();
+        const nextParam = after.match(/\s--[a-z][\w-]*(?:\s|$)/i);
+        let params = "";
+        if (nextParam && typeof nextParam.index === "number") {
+            params = after.slice(nextParam.index).trim();
+            after = after.slice(0, nextParam.index).trim();
+        }
+        return { positive: before, negative: after, params };
+    }
+
+    function parseMidjourneySegment(segment, role) {
+        const s = String(segment || "").trim();
+        const idx = s.lastIndexOf("::");
+        if (idx > 0) {
+            const left = s.slice(0, idx).trim();
+            const right = s.slice(idx + 2).trim();
+            const n = parseNumberStrict(right);
+            if (left && n !== null) return makeItem(unescapePromptText(left), n, role);
+        }
+        return makeItem(unescapePromptText(s), 1, role);
+    }
+
+    function parseMidjourney(text) {
+        const blocks = splitMidjourneyNo(text);
+        const positiveChunks = splitTopLevel(blocks.positive.replace(/\n+/g, ","), ",");
+        const negativeChunks = splitTopLevel(blocks.negative.replace(/\n+/g, ","), ",");
+        const items = [
+            ...positiveChunks.map(x => parseMidjourneySegment(x, "positive")),
+            ...negativeChunks.map(x => parseMidjourneySegment(x, "negative"))
+        ];
+        if (blocks.params) items.push(makeItem(blocks.params, 1, "metadata", { kind: "midjourney_parameters" }));
+        return cleanItems(items);
+    }
+
+    function parseJSONAst(text) {
+        const parsed = JSON.parse(text);
+        const rawItems = Array.isArray(parsed) ? parsed : (parsed.items || parsed.prompt || []);
+        if (!Array.isArray(rawItems)) throw new Error("JSON AST must be an array or an object with an items array.");
+        return cleanItems(rawItems.map(item => {
+            if (typeof item === "string") return makeItem(item, 1, "positive");
+            return makeItem(item.text ?? item.prompt ?? item.tag ?? "", item.weight ?? 1, item.role ?? item.section ?? "positive", item);
+        }));
+    }
+
+    function parseYamlList(text) {
+        const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+        const items = [];
+        let cur = null;
+        function commit() {
+            if (cur && cur.text) items.push(makeItem(cur.text, cur.weight ?? 1, cur.role ?? "positive"));
+            cur = null;
+        }
+
+        for (const raw of lines) {
+            const line = raw.trim();
+            if (!line || line.startsWith("#")) continue;
+            if (line.startsWith("- ")) {
+                commit();
+                const body = line.slice(2).trim();
+                const inlineText = body.match(/^(?:text|tag|prompt)\s*:\s*(.*)$/i);
+                if (inlineText) cur = { text: unquoteYaml(inlineText[1]) };
+                else cur = { text: unquoteYaml(body) };
+                continue;
+            }
+            const kv = line.match(/^(text|tag|prompt|weight|role|section)\s*:\s*(.*)$/i);
+            if (kv) {
+                if (!cur) cur = {};
+                const key = kv[1].toLowerCase();
+                const val = unquoteYaml(kv[2]);
+                if (["text", "tag", "prompt"].includes(key)) cur.text = val;
+                else if (key === "weight") cur.weight = parseNumberStrict(val) ?? 1;
+                else if (key === "role" || key === "section") cur.role = val;
+            }
+        }
+        commit();
+        return cleanItems(items);
+    }
+
+    function unquoteYaml(value) {
+        const s = String(value || "").trim();
+        if ((s.startsWith("\"") && s.endsWith("\"")) || (s.startsWith("'") && s.endsWith("'"))) {
+            return s.slice(1, -1).replace(/\\"/g, "\"").replace(/''/g, "'");
+        }
+        return s;
+    }
+
+    const Parsers = {
+        sd_webui: text => parseSD(text, false),
+        sd_metadata: text => parseSD(text, true),
+        novelai: parseNovelAI,
+        comfy_compel: parseCompel,
+        plain_commas: parsePlainCommas,
+        plain_lines: parsePlainLines,
+        weighted_commas: parseWeightedCommas,
+        weighted_lines: parseWeightedLines,
+        midjourney: parseMidjourney,
+        json_ast: parseJSONAst,
+        yaml_list: parseYamlList
+    };
+
+    function splitByRole(items) {
+        return {
+            positive: items.filter(i => normalizeRole(i.role) === "positive"),
+            negative: items.filter(i => normalizeRole(i.role) === "negative"),
+            metadata: items.filter(i => String(i.role || "").toLowerCase() === "metadata")
+        };
+    }
+
+    function formatWithNegative(items, formatter, negativePrefix = "Negative prompt: ", metadataFormatter = null) {
+        const groups = splitByRole(items);
+        const pos = groups.positive.map(formatter).filter(Boolean).join(", ");
+        const neg = groups.negative.map(formatter).filter(Boolean).join(", ");
+        const chunks = [];
+        if (pos) chunks.push(pos);
+        if (neg) chunks.push(negativePrefix + neg);
+        if (metadataFormatter) {
+            const meta = groups.metadata.map(metadataFormatter).filter(Boolean).join("\n");
+            if (meta) chunks.push(meta);
+        }
+        return chunks.join("\n");
+    }
+
+    function formatPlainText(i) {
+        return escapeForDelimitedText(i.text);
+    }
+
+    function formatSDToken(i) {
+        const text = escapeForWeightedParens(i.text);
+        if (nearly(i.weight, 1)) return text;
+        return `(${text}:${roundWeight(i.weight)})`;
+    }
+
+    function repeatDecorators(text, weight, upFactor, downFactor, upOpen, upClose, downOpen, downClose) {
+        if (nearly(weight, 1)) return escapeForDelimitedText(text);
+        const factor = weight > 1 ? upFactor : downFactor;
+        let repeat = Math.round(Math.log(weight) / Math.log(factor));
+        if (!Number.isFinite(repeat) || repeat < 1) repeat = 1;
+        repeat = Math.min(MAX_DECORATOR_REPEAT, repeat);
+        const open = weight > 1 ? upOpen : downOpen;
+        const close = weight > 1 ? upClose : downClose;
+        return `${open.repeat(repeat)}${escapeForDelimitedText(text)}${close.repeat(repeat)}`;
+    }
+
+    function formatNovelAIToken(i) {
+        return repeatDecorators(i.text, i.weight, NAI_UP, NAI_DOWN, "{", "}", "[", "]");
+    }
+
+    function formatCompelToken(i) {
+        const text = escapeForWeightedParens(i.text);
+        if (nearly(i.weight, 1)) return text;
+        const upSteps = Math.round(Math.log(i.weight) / Math.log(SD_UP));
+        const downSteps = Math.round(Math.log(i.weight) / Math.log(SD_DOWN));
+        if (i.weight > 1 && upSteps >= 1 && upSteps <= 6 && nearly(i.weight, Math.pow(SD_UP, upSteps), 0.01)) {
+            return `(${text})${"+".repeat(upSteps)}`;
+        }
+        if (i.weight < 1 && downSteps >= 1 && downSteps <= 6 && nearly(i.weight, Math.pow(SD_DOWN, downSteps), 0.01)) {
+            return `(${text})${"-".repeat(downSteps)}`;
+        }
+        return `(${text})${roundWeight(i.weight)}`;
+    }
+
+    function formatWeightedCSVToken(i) {
+        if (nearly(i.weight, 1)) return escapeForDelimitedText(i.text);
+        return `${escapeForDelimitedText(i.text)}:${roundWeight(i.weight)}`;
+    }
+
+    function formatWeightedLineToken(i) {
+        return `${i.role === "negative" ? "negative: " : ""}${i.text} | ${roundWeight(i.weight)}`;
+    }
+
+    function formatMidjourney(items) {
+        const groups = splitByRole(items);
+        const pos = groups.positive.map(i => nearly(i.weight, 1) ? i.text : `${i.text}::${roundWeight(i.weight)}`).join(" ").trim();
+        const neg = groups.negative.map(i => nearly(i.weight, 1) ? i.text : `${i.text}::${roundWeight(i.weight)}`).join(", ").trim();
+        const meta = groups.metadata.map(i => i.text).join(" ").trim();
+        return [pos, neg ? `--no ${neg}` : "", meta].filter(Boolean).join(" ").trim();
+    }
+
+    function yamlQuote(s) {
+        const text = String(s || "");
+        if (/^[A-Za-z0-9_ .-]+$/.test(text) && text.trim() === text && text.length > 0) return text;
+        return JSON.stringify(text);
+    }
+
+    const Formatters = {
+        sd_webui: items => formatWithNegative(items, formatSDToken),
+        sd_metadata: items => formatWithNegative(items, formatSDToken, "Negative prompt: ", i => i.text),
+        novelai: items => formatWithNegative(items, formatNovelAIToken),
+        comfy_compel: items => formatWithNegative(items, formatCompelToken),
+        plain_commas: items => formatWithNegative(items, formatPlainText),
+        plain_lines: items => {
+            const groups = splitByRole(items);
+            const out = [];
+            groups.positive.forEach(i => out.push(i.text));
+            groups.negative.forEach(i => out.push(`negative: ${i.text}`));
+            groups.metadata.forEach(i => out.push(`metadata: ${i.text}`));
+            return out.join("\n");
+        },
+        weighted_commas: items => formatWithNegative(items, formatWeightedCSVToken),
+        weighted_lines: items => splitByRole(items).positive.concat(splitByRole(items).negative).map(formatWeightedLineToken).join("\n"),
+        midjourney: formatMidjourney,
+        json_ast: items => JSON.stringify(cleanItems(items), null, 2),
+        yaml_list: items => cleanItems(items).map(i => `- text: ${yamlQuote(i.text)}\n  weight: ${roundWeight(i.weight)}\n  role: ${normalizeRole(i.role)}`).join("\n")
+    };
+
+    const inputTx = document.getElementById("inputText");
+    const inputFm = document.getElementById("inputFormat");
+    const jsonTx = document.getElementById("jsonOutput");
+    const outputFm = document.getElementById("outputFormat");
+    const outputTx = document.getElementById("outputText");
+    const inputHint = document.getElementById("inputHint");
+    const outputHint = document.getElementById("outputHint");
+    const statusPill = document.getElementById("statusPill");
+
+    function populateFormats() {
+        for (const select of [inputFm, outputFm]) {
+            select.innerHTML = "";
+            for (const fmt of FORMAT_DEFS) {
+                const opt = document.createElement("option");
+                opt.value = fmt.id;
+                opt.textContent = fmt.label;
+                select.appendChild(opt);
+            }
+        }
+        inputFm.value = "sd_webui";
+        outputFm.value = "novelai";
+    }
+
+    function currentHint(formatId) {
+        return FORMAT_DEFS.find(f => f.id === formatId)?.hint || "";
+    }
+
+    function setStatus(kind, message) {
+        statusPill.className = "pill " + (kind || "");
+        statusPill.textContent = message;
+    }
+
+    function parseCurrentInput() {
+        const parser = Parsers[inputFm.value];
+        if (!parser) throw new Error(`No parser registered for ${inputFm.value}`);
+        return parser(inputTx.value);
+    }
+
+    function process() {
+        inputHint.textContent = currentHint(inputFm.value);
+        outputHint.textContent = currentHint(outputFm.value);
+
+        const text = inputTx.value;
+        if (!text.trim()) {
+            jsonTx.value = "";
+            outputTx.value = "";
+            setStatus("", "Idle");
+            return;
+        }
+
+        try {
+            const ast = parseCurrentInput();
+            const formatter = Formatters[outputFm.value];
+            if (!formatter) throw new Error(`No formatter registered for ${outputFm.value}`);
+            jsonTx.value = JSON.stringify(ast, null, 2);
+            outputTx.value = formatter(ast);
+            const pos = ast.filter(i => i.role === "positive").length;
+            const neg = ast.filter(i => i.role === "negative").length;
+            const meta = ast.filter(i => i.role === "metadata").length;
+            setStatus("ok", `${ast.length} records: ${pos}+ / ${neg}- / ${meta} meta`);
+        } catch (e) {
+            jsonTx.value = `Parser Error: ${e.message}`;
+            outputTx.value = "";
+            setStatus("err", "Parser error");
+        }
+    }
+
+    document.getElementById("swapBtn").addEventListener("click", () => {
+        const oldInput = inputFm.value;
+        inputFm.value = outputFm.value;
+        outputFm.value = oldInput;
+        inputTx.value = outputTx.value || inputTx.value;
+        process();
+    });
+
+    document.getElementById("copyBtn").addEventListener("click", async () => {
+        const text = outputTx.value;
+        if (!text) return;
+        try {
+            await navigator.clipboard.writeText(text);
+            setStatus("ok", "Copied output");
+        } catch (_) {
+            outputTx.focus();
+            outputTx.select();
+            setStatus("warn", "Select/copy manually");
+        }
+    });
+
+    document.getElementById("sampleBtn").addEventListener("click", () => {
+        inputFm.value = "sd_webui";
+        outputFm.value = "comfy_compel";
+        inputTx.value = "masterpiece, ((detailed mechanical wings)), (retro robot, brass panels:1.35), [motion blur], city skyline\\, at sunset\nNegative prompt: low quality, (extra fingers:1.2), [soft focus]";
+        process();
+    });
+
+    document.getElementById("clearBtn").addEventListener("click", () => {
+        inputTx.value = "";
+        process();
+    });
+
+    [inputTx, inputFm, outputFm].forEach(el => el.addEventListener("input", process));
+    [inputFm, outputFm].forEach(el => el.addEventListener("change", process));
+
+    populateFormats();
+    process();
+})();
+</script>
+</body>
+</html>
